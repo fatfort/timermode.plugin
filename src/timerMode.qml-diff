@@ -1,0 +1,850 @@
+;LOAD timerMode.qmd
+;
+;Stopwatch + Timer tiles in xochitl Quick Settings, with the timer
+;picker injected into the panel's brightness RowLayout (beside the
+;sliders) and a floating expiry alert injected into DocumentView so
+;it can pop over the document area regardless of what's on screen.
+;
+;Architecture — three injection sites communicating via one JSON file:
+;
+;  1. Tiles  (SLOT timerTiles, into ToggleColumn.qml + ToggleGrid.qml)
+;     - Stopwatch tile: tap = run/pause, long-press = reset
+;     - Timer tile:    tap (idle) = toggle pickerOpen flag in JSON
+;                      tap (running) = cancel
+;                      long-press (idle) = start with current saved
+;                                          (savedMin, savedSec)
+;                      long-press (running) = cancel
+;     - Both tiles render mm:ss overlay text from JSON state.
+;
+;  2. Picker (SLOT timerPicker, into QuickSettingsWindow.qml ColumnLayout
+;     after the brightness RowLayout)
+;     - Visible only when JSON.pickerOpen is true.
+;     - Layout.preferredHeight=0 when hidden so it doesn't reserve space.
+;     - When open: presets row [1m 5m 10m 15m 25m 45m 60m] + min/sec
+;       custom steppers (− [NN] +) + Start / Cancel buttons.
+;     - Polls /home/root/.timer-state every 500ms; writes back on every
+;       user interaction.
+;
+;  3. Expiry alert (SLOT expiredAlert, into
+;     /qml/device/view/documentview/DocumentView.qml)
+;     - Anchored centered on _uiContainer (the document area).
+;     - Polls /home/root/.timer-state for `expired:true`. When detected,
+;       overlays a black rectangle with white "Timer ended — tap to
+;       dismiss" text on z=10000 over the document.
+;     - Tap to dismiss writes `expired:false` back to JSON.
+;     - Caveat: appears over the document view ONLY. From the homescreen
+;       (no notebook open), DocumentView isn't instantiated and the
+;       alert won't show; reMarkable also has no audio so a missed
+;       alert is silent. A homescreen-side mirror is deferred.
+;
+;State persistence — /home/root/.timer-state (single file, all
+;readers/writers merge their fields):
+;  {
+;    "deadlineMs":  number,    // wall-clock end of current countdown (0 = idle)
+;    "durationMs":  number,    // remembered duration of the current countdown
+;    "savedMin":    number,    // picker's saved minutes
+;    "savedSec":    number,    // picker's saved seconds
+;    "pickerOpen":  boolean,   // is the in-panel picker visible
+;    "expired":     boolean,   // has the latest countdown crossed deadlineMs
+;                              // and not yet been dismissed
+;  }
+;  /home/root/.stopwatch-state (separate, unchanged):
+;  { "running": bool, "startMs": int, "accumulatedMs": int }
+;
+;Timer expiry detection happens in the tile's poll: when readTimerState
+;observes deadlineMs > 0 and Date.now() >= deadlineMs, it clears
+;deadlineMs/durationMs and writes `expired:true`. The DocumentView
+;alert's poll picks that up and pops.
+;
+;Compile via bin/compile-qmd.sh; install via the project Makefile.
+;Target firmware: 3.26.0.68 (rMPP ferrari + rMPP Move porsche).
+
+SLOT timerTiles
+    INSERT {
+        QuickSettingsToggle {
+            id: stopwatchButton
+            enabled: true
+            iconSource: "qrc:/ark/icons/system_clock"
+
+            property bool running: false
+            property var startMs: 0
+            property var accumulatedMs: 0
+            property var lastTickMs: 0
+            property string overlayText: "00:00"
+
+            readonly property int sleepResetThresholdMs: 30000
+
+            function readStopwatchState() {
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/.stopwatch-state", false);
+                    xhr.send();
+                    if (xhr.responseText) {
+                        var d = JSON.parse(xhr.responseText);
+                        running = !!d.running;
+                        startMs = d.startMs || 0;
+                        accumulatedMs = d.accumulatedMs || 0;
+                        lastTickMs = d.lastTickMs || 0;
+                    }
+                } catch (e) {}
+                if (running && lastTickMs > 0
+                    && (Date.now() - lastTickMs) > sleepResetThresholdMs) {
+                    running = false;
+                    startMs = 0;
+                    accumulatedMs = 0;
+                    lastTickMs = Date.now();
+                    writeStopwatchState();
+                }
+                selected = running;
+                refreshOverlay();
+            }
+
+            function writeStopwatchState() {
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("PUT", "file:///home/root/.stopwatch-state");
+                    xhr.send(JSON.stringify({
+                        running: running,
+                        startMs: startMs,
+                        accumulatedMs: accumulatedMs,
+                        lastTickMs: lastTickMs
+                    }));
+                } catch (e) {}
+            }
+
+            function elapsedMs() {
+                if (running && startMs > 0) {
+                    return accumulatedMs + (Date.now() - startMs);
+                }
+                return accumulatedMs;
+            }
+
+            function refreshOverlay() {
+                var ms = elapsedMs();
+                var totalSec = Math.floor(ms / 1000);
+                var mm = Math.floor(totalSec / 60);
+                var ss = totalSec % 60;
+                overlayText = (mm < 10 ? "0" : "") + mm + ":" + (ss < 10 ? "0" : "") + ss;
+            }
+
+            Component.onCompleted: readStopwatchState()
+
+            Timer {
+                interval: 1000
+                repeat: true
+                running: stopwatchButton.running
+                onTriggered: {
+                    stopwatchButton.lastTickMs = Date.now();
+                    stopwatchButton.writeStopwatchState();
+                    stopwatchButton.refreshOverlay();
+                }
+            }
+
+            Text {
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 6
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: stopwatchButton.overlayText
+                color: "black"
+                font.pointSize: 11
+                font.bold: stopwatchButton.running
+            }
+
+            onClicked: {
+                var now = Date.now();
+                if (running) {
+                    accumulatedMs = accumulatedMs + (now - startMs);
+                    startMs = 0;
+                    running = false;
+                } else {
+                    startMs = now;
+                    running = true;
+                }
+                selected = running;
+                writeStopwatchState();
+                refreshOverlay();
+            }
+
+            onPressAndHold: {
+                running = false;
+                startMs = 0;
+                accumulatedMs = 0;
+                selected = false;
+                writeStopwatchState();
+                refreshOverlay();
+            }
+        }
+
+        QuickSettingsToggle {
+            id: timerButton
+            enabled: true
+            iconSource: "qrc:/ark/icons/clock_arrow_up"
+
+            property var deadlineMs: 0
+            property int durationMs: 0
+            property int savedMin: 5
+            property int savedSec: 0
+            property bool pickerOpen: false
+            property string overlayText: "05:00"
+
+            function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+            function readTimerState() {
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/.timer-state", false);
+                    xhr.send();
+                    if (xhr.responseText) {
+                        var d = JSON.parse(xhr.responseText);
+                        deadlineMs = d.deadlineMs || 0;
+                        durationMs = d.durationMs || 0;
+                        if (d.savedMin !== undefined) savedMin = d.savedMin;
+                        if (d.savedSec !== undefined) savedSec = d.savedSec;
+                        pickerOpen = !!d.pickerOpen;
+                    }
+                } catch (e) {}
+                if (deadlineMs && deadlineMs <= Date.now()) {
+                    deadlineMs = 0;
+                    durationMs = 0;
+                    writeTimerState({expired: true});
+                }
+                selected = deadlineMs > Date.now();
+                refreshOverlay();
+            }
+
+            function writeTimerState(extras) {
+                var data = {};
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/.timer-state", false);
+                    xhr.send();
+                    if (xhr.responseText) data = JSON.parse(xhr.responseText);
+                } catch (e) {}
+                data.deadlineMs = deadlineMs;
+                data.durationMs = durationMs;
+                data.savedMin = savedMin;
+                data.savedSec = savedSec;
+                data.pickerOpen = pickerOpen;
+                if (extras) {
+                    for (var k in extras) data[k] = extras[k];
+                }
+                try {
+                    xhr = new XMLHttpRequest();
+                    xhr.open("PUT", "file:///home/root/.timer-state");
+                    xhr.send(JSON.stringify(data));
+                } catch (e) {}
+            }
+
+            function startTimerFromSaved() {
+                if (savedMin <= 0 && savedSec <= 0) return;
+                durationMs = (savedMin * 60 + savedSec) * 1000;
+                deadlineMs = Date.now() + durationMs;
+                pickerOpen = false;
+                selected = true;
+                writeTimerState({expired: false});
+                refreshOverlay();
+            }
+
+            function cancelTimer() {
+                deadlineMs = 0;
+                durationMs = 0;
+                pickerOpen = false;
+                selected = false;
+                writeTimerState({expired: false});
+                refreshOverlay();
+            }
+
+            function refreshOverlay() {
+                if (selected && deadlineMs > Date.now()) {
+                    var rem = deadlineMs - Date.now();
+                    var totalSec = Math.ceil(rem / 1000);
+                    var mm = Math.floor(totalSec / 60);
+                    var ss = totalSec % 60;
+                    overlayText = pad2(mm) + ":" + pad2(ss);
+                } else {
+                    overlayText = pad2(savedMin) + ":" + pad2(savedSec);
+                }
+            }
+
+            Component.onCompleted: readTimerState()
+
+            Timer {
+                interval: 500
+                repeat: true
+                running: true
+                onTriggered: timerButton.readTimerState()
+            }
+
+            Text {
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 6
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: timerButton.overlayText
+                color: "black"
+                font.pointSize: 11
+                font.bold: timerButton.selected
+            }
+
+            onClicked: {
+                if (selected) {
+                    cancelTimer();
+                } else {
+                    pickerOpen = !pickerOpen;
+                    writeTimerState();
+                }
+            }
+
+            onPressAndHold: {
+                if (selected) cancelTimer();
+                else timerButton.startTimerFromSaved();
+            }
+        }
+    }
+END SLOT
+
+SLOT stopwatchPill
+    INSERT {
+        Rectangle {
+            id: stopwatchPillInQS
+
+            property bool running: false
+            property var startMs: 0
+            property var accumulatedMs: 0
+            property string overlayText: "00:00"
+
+            function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+            visible: running || accumulatedMs > 0
+            Layout.alignment: Qt.AlignHCenter
+            Layout.preferredWidth: 168
+            Layout.preferredHeight: visible ? 52 : 0
+            Layout.topMargin: visible ? 32 : 0
+            implicitWidth: 168
+            implicitHeight: visible ? 52 : 0
+            color: "white"
+            border.color: "black"
+            border.width: 2
+            radius: 8
+
+            function refresh() {
+                var data = {};
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/.stopwatch-state", false);
+                    xhr.send();
+                    if (xhr.responseText) data = JSON.parse(xhr.responseText);
+                } catch (e) {}
+                running = !!data.running;
+                startMs = data.startMs || 0;
+                accumulatedMs = data.accumulatedMs || 0;
+
+                var elapsedMs = accumulatedMs;
+                if (running && startMs > 0) {
+                    elapsedMs = accumulatedMs + (Date.now() - startMs);
+                }
+                var totalSec = Math.floor(elapsedMs / 1000);
+                var mm = Math.floor(totalSec / 60);
+                var ss = totalSec % 60;
+                overlayText = pad2(mm) + ":" + pad2(ss);
+            }
+
+            Timer {
+                interval: 500
+                repeat: true
+                running: true
+                onTriggered: stopwatchPillInQS.refresh()
+            }
+
+            Component.onCompleted: refresh()
+
+            Text {
+                anchors.centerIn: parent
+                text: "⏱ " + stopwatchPillInQS.overlayText
+                color: "black"
+                font.pointSize: 20
+                font.bold: stopwatchPillInQS.running
+            }
+        }
+    }
+END SLOT
+
+SLOT countdownPill
+    INSERT {
+        Rectangle {
+            id: timerCountdownPill
+
+            property var deadlineMs: 0
+            property bool active: false
+            property string overlayText: ""
+
+            function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+            visible: active
+            Layout.alignment: Qt.AlignHCenter
+            Layout.preferredWidth: 168
+            Layout.preferredHeight: visible ? 52 : 0
+            Layout.topMargin: visible ? (stopwatchPillInQS.visible ? 20 : 32) : 0
+            implicitWidth: 168
+            implicitHeight: visible ? 52 : 0
+            color: "white"
+            border.color: "black"
+            border.width: 2
+            radius: 8
+
+            function refresh() {
+                var data = {};
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/.timer-state", false);
+                    xhr.send();
+                    if (xhr.responseText) data = JSON.parse(xhr.responseText);
+                } catch (e) {}
+                deadlineMs = data.deadlineMs || 0;
+                var rem = deadlineMs - Date.now();
+                active = (deadlineMs > 0 && rem > 0);
+                if (active) {
+                    var totalSec = Math.ceil(rem / 1000);
+                    var mm = Math.floor(totalSec / 60);
+                    var ss = totalSec % 60;
+                    overlayText = "⏳ " + pad2(mm) + ":" + pad2(ss);
+                }
+            }
+
+            Timer {
+                interval: 500
+                repeat: true
+                running: true
+                onTriggered: timerCountdownPill.refresh()
+            }
+
+            Component.onCompleted: refresh()
+
+            Text {
+                anchors.centerIn: parent
+                text: timerCountdownPill.overlayText
+                color: "black"
+                font.pointSize: 20
+                font.bold: true
+            }
+        }
+    }
+END SLOT
+
+SLOT timerPicker
+    INSERT {
+        Rectangle {
+            id: timerPickerInQS
+
+            property int savedMin: 5
+            property int savedSec: 0
+            property bool pickerOpen: false
+
+            visible: pickerOpen
+            Layout.alignment: Qt.AlignHCenter
+            Layout.preferredWidth: 296
+            Layout.preferredHeight: visible ? 620 : 0
+            Layout.topMargin: visible ? 12 : 0
+            Layout.bottomMargin: visible ? 8 : 0
+            implicitWidth: 296
+            implicitHeight: visible ? 620 : 0
+            color: "white"
+            border.color: "black"
+            border.width: 2
+            radius: 8
+
+            component PressButton: Rectangle {
+                id: pressBtn
+                property string label: ""
+                property int fontSize: 14
+                property bool emphasis: false
+                signal pressed()
+                signal pressAndHold()
+                width: 60
+                height: 44
+                radius: 4
+                color: pressArea.pressed ? "#bbbbbb" : (emphasis ? "#222222" : "white")
+                border.color: "black"
+                border.width: 2
+                Text {
+                    anchors.centerIn: parent
+                    text: pressBtn.label
+                    font.pointSize: pressBtn.fontSize
+                    font.bold: pressBtn.emphasis
+                    color: pressBtn.emphasis ? "white" : "black"
+                }
+                MouseArea {
+                    id: pressArea
+                    anchors.fill: parent
+                    onClicked: pressBtn.pressed()
+                    onPressAndHold: pressBtn.pressAndHold()
+                }
+            }
+
+            component NumberStepper: Row {
+                id: stepper
+                property int value: 0
+                property int min: 0
+                property int max: 99
+                signal valueEdited(int newValue)
+                spacing: 8
+
+                function _bump(delta) {
+                    var v = stepper.value + delta;
+                    if (v < stepper.min) v = stepper.min;
+                    if (v > stepper.max) v = stepper.max;
+                    if (v !== stepper.value) stepper.valueEdited(v);
+                }
+
+                function _commitInput(raw) {
+                    var v = parseInt(raw, 10);
+                    if (isNaN(v)) v = stepper.value;
+                    if (v < stepper.min) v = stepper.min;
+                    if (v > stepper.max) v = stepper.max;
+                    if (v !== stepper.value) stepper.valueEdited(v);
+                    numInput.text = Qt.binding(function() { return ("00" + stepper.value).slice(-2); });
+                }
+
+                PressButton {
+                    width: 56; height: 64
+                    label: "−"
+                    fontSize: 24
+                    onPressed: stepper._bump(-1)
+                    onPressAndHold: stepper._bump(-10)
+                }
+                Rectangle {
+                    width: 104; height: 64
+                    border.color: numInput.activeFocus ? "#222222" : "black"
+                    border.width: numInput.activeFocus ? 3 : 2
+                    radius: 4
+                    color: "white"
+                    TextInput {
+                        id: numInput
+                        anchors.fill: parent
+                        anchors.margins: 4
+                        verticalAlignment: TextInput.AlignVCenter
+                        horizontalAlignment: TextInput.AlignHCenter
+                        font.pointSize: 22
+                        font.bold: true
+                        selectByMouse: true
+                        activeFocusOnTab: true
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        maximumLength: 2
+                        validator: IntValidator { bottom: stepper.min; top: stepper.max }
+                        text: ("00" + stepper.value).slice(-2)
+                        onEditingFinished: stepper._commitInput(text)
+                        onActiveFocusChanged: {
+                            if (activeFocus) {
+                                selectAll();
+                            } else {
+                                stepper._commitInput(text);
+                            }
+                        }
+                    }
+                }
+                PressButton {
+                    width: 56; height: 64
+                    label: "+"
+                    fontSize: 24
+                    onPressed: stepper._bump(1)
+                    onPressAndHold: stepper._bump(10)
+                }
+            }
+
+            function readState() {
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/.timer-state", false);
+                    xhr.send();
+                    if (xhr.responseText) {
+                        var d = JSON.parse(xhr.responseText);
+                        if (d.savedMin !== undefined) savedMin = d.savedMin;
+                        if (d.savedSec !== undefined) savedSec = d.savedSec;
+                        pickerOpen = !!d.pickerOpen;
+                    }
+                } catch (e) {}
+            }
+
+            function writeState(extras) {
+                var data = {};
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/.timer-state", false);
+                    xhr.send();
+                    if (xhr.responseText) data = JSON.parse(xhr.responseText);
+                } catch (e) {}
+                data.savedMin = savedMin;
+                data.savedSec = savedSec;
+                data.pickerOpen = pickerOpen;
+                if (extras) {
+                    for (var k in extras) data[k] = extras[k];
+                }
+                try {
+                    xhr = new XMLHttpRequest();
+                    xhr.open("PUT", "file:///home/root/.timer-state");
+                    xhr.send(JSON.stringify(data));
+                } catch (e) {}
+            }
+
+            function startTimer() {
+                if (savedMin <= 0 && savedSec <= 0) return;
+                var dur = (savedMin * 60 + savedSec) * 1000;
+                var deadline = Date.now() + dur;
+                pickerOpen = false;
+                writeState({deadlineMs: deadline, durationMs: dur, expired: false});
+            }
+
+            function cancelPicker() {
+                pickerOpen = false;
+                writeState();
+            }
+
+            Component.onCompleted: readState()
+
+            Timer {
+                interval: 500
+                repeat: true
+                running: true
+                onTriggered: timerPickerInQS.readState()
+            }
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 14
+                spacing: 6
+
+                GridLayout {
+                    Layout.alignment: Qt.AlignHCenter
+                    columns: 3
+                    rowSpacing: 8
+                    columnSpacing: 8
+                    Repeater {
+                        model: [1, 5, 10, 15, 20, 25, 30, 45, 60]
+                        delegate: PressButton {
+                            label: modelData + "m"
+                            width: 84
+                            height: 64
+                            fontSize: 17
+                            onPressed: {
+                                timerPickerInQS.savedMin = modelData;
+                                timerPickerInQS.savedSec = 0;
+                                timerPickerInQS.writeState();
+                            }
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    Layout.alignment: Qt.AlignHCenter
+                    spacing: 4
+                    Text {
+                        text: "Min"
+                        font.pointSize: 14
+                        Layout.alignment: Qt.AlignHCenter
+                    }
+                    NumberStepper {
+                        Layout.alignment: Qt.AlignHCenter
+                        value: timerPickerInQS.savedMin
+                        min: 0; max: 99
+                        onValueEdited: function(v) {
+                            timerPickerInQS.savedMin = v;
+                            timerPickerInQS.writeState();
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    Layout.alignment: Qt.AlignHCenter
+                    spacing: 4
+                    Text {
+                        text: "Sec"
+                        font.pointSize: 14
+                        Layout.alignment: Qt.AlignHCenter
+                    }
+                    NumberStepper {
+                        Layout.alignment: Qt.AlignHCenter
+                        value: timerPickerInQS.savedSec
+                        min: 0; max: 59
+                        onValueEdited: function(v) {
+                            timerPickerInQS.savedSec = v;
+                            timerPickerInQS.writeState();
+                        }
+                    }
+                }
+
+                RowLayout {
+                    Layout.alignment: Qt.AlignHCenter
+                    Layout.topMargin: 8
+                    spacing: 14
+                    PressButton {
+                        label: "Start"
+                        width: 124
+                        height: 64
+                        fontSize: 19
+                        emphasis: true
+                        onPressed: timerPickerInQS.startTimer()
+                    }
+                    PressButton {
+                        label: "Cancel"
+                        width: 124
+                        height: 64
+                        fontSize: 19
+                        onPressed: timerPickerInQS.cancelPicker()
+                    }
+                }
+            }
+        }
+    }
+END SLOT
+
+SLOT timerOverlays
+    INSERT {
+        Item {
+            id: timerExpiryWatcher
+            visible: false
+            width: 0; height: 0
+
+            Timer {
+                interval: 1000
+                repeat: true
+                running: true
+                onTriggered: {
+                    var data = {};
+                    var xhr = new XMLHttpRequest();
+                    try {
+                        xhr.open("GET", "file:///home/root/.timer-state", false);
+                        xhr.send();
+                        if (xhr.responseText) data = JSON.parse(xhr.responseText);
+                    } catch (e) {}
+                    if (data.deadlineMs > 0 && data.deadlineMs <= Date.now() && !data.expired) {
+                        data.deadlineMs = 0;
+                        data.durationMs = 0;
+                        data.expired = true;
+                        try {
+                            var put = new XMLHttpRequest();
+                            put.open("PUT", "file:///home/root/.timer-state");
+                            put.send(JSON.stringify(data));
+                        } catch (e) {}
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            id: timerExpiredAlertOverlay
+
+            property bool expired: false
+
+            visible: expired
+            anchors.centerIn: parent
+            width: 600
+            height: 240
+            z: 10000
+            color: "black"
+            border.color: "white"
+            border.width: 4
+            radius: 12
+
+            function readState() {
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/.timer-state", false);
+                    xhr.send();
+                    if (xhr.responseText) {
+                        var d = JSON.parse(xhr.responseText);
+                        expired = !!d.expired;
+                    }
+                } catch (e) {}
+            }
+
+            function dismiss() {
+                var data = {};
+                var xhr = new XMLHttpRequest();
+                try {
+                    xhr.open("GET", "file:///home/root/.timer-state", false);
+                    xhr.send();
+                    if (xhr.responseText) data = JSON.parse(xhr.responseText);
+                } catch (e) {}
+                data.expired = false;
+                try {
+                    xhr = new XMLHttpRequest();
+                    xhr.open("PUT", "file:///home/root/.timer-state");
+                    xhr.send(JSON.stringify(data));
+                } catch (e) {}
+                expired = false;
+            }
+
+            Timer {
+                interval: 1000
+                repeat: true
+                running: true
+                onTriggered: timerExpiredAlertOverlay.readState()
+            }
+
+            Text {
+                anchors.top: parent.top
+                anchors.topMargin: 60
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "⏰ Timer ended"
+                color: "white"
+                font.pointSize: 32
+                font.bold: true
+            }
+            Text {
+                anchors.bottom: parent.bottom
+                anchors.bottomMargin: 32
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "tap to dismiss"
+                color: "white"
+                font.pointSize: 14
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                onClicked: timerExpiredAlertOverlay.dismiss()
+            }
+        }
+    }
+END SLOT
+
+AFFECT /qt/qml/xofm/modules/settings/qml/quicksettings/ToggleColumn.qml
+    TRAVERSE ?#root
+        LOCATE AFTER Repeater
+        INSERT SLOT timerTiles
+    END TRAVERSE
+END AFFECT
+
+AFFECT /qt/qml/xofm/modules/settings/qml/quicksettings/ToggleGrid.qml
+    TRAVERSE ?#root
+        LOCATE AFTER Repeater
+        INSERT SLOT timerTiles
+    END TRAVERSE
+END AFFECT
+
+AFFECT /qt/qml/xofm/modules/settings/qml/QuickSettingsWindow.qml
+    TRAVERSE BaseView#root > Item > Background > ColumnLayout#_layout
+        LOCATE BEFORE RowLayout
+        INSERT SLOT stopwatchPill
+    END TRAVERSE
+    TRAVERSE BaseView#root > Item > Background > ColumnLayout#_layout
+        LOCATE BEFORE RowLayout
+        INSERT SLOT countdownPill
+    END TRAVERSE
+    TRAVERSE BaseView#root > Item > Background > ColumnLayout#_layout
+        LOCATE AFTER RowLayout
+        INSERT SLOT timerPicker
+    END TRAVERSE
+END AFFECT
+
+AFFECT /qml/device/view/documentview/DocumentView.qml
+    TRAVERSE FocusScope > Item#_uiContainer
+        LOCATE AFTER ALL
+        INSERT SLOT timerOverlays
+    END TRAVERSE
+END AFFECT
+
+AFFECT /qml/device/view/navigator/Navigator.qml
+    TRAVERSE FocusScope
+        LOCATE AFTER ALL
+        INSERT SLOT timerOverlays
+    END TRAVERSE
+END AFFECT
